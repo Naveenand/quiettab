@@ -13,6 +13,7 @@
     <resource-bundle>messages.MyBundle</resource-bundle>
 
     <extensions defaultExtensionNs="com.intellij">
+        <inline.completion.provider implementation="com.github.naveenand.quiettab.QuietTabProvider"/>
         <toolWindow factoryClass="com.github.naveenand.quiettab.toolWindow.MyToolWindowFactory" id="MyToolWindow"/>
         <postStartupActivity implementation="com.github.naveenand.quiettab.startup.MyProjectActivity" />
     </extensions>
