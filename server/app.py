@@ -27,14 +27,18 @@ def token_logprob(t: dict) -> float:
 @app.post("/complete")
 async def complete(req: CompleteRequest):
     start = time.perf_counter()
+    current_line = req.prefix.rsplit("\n", 1)[-1]      # text before the cursor on this line
+    single_line = current_line.strip() != ""            # typing mid-line?
+    stop = ["\n"] if single_line else ["\n\n", "\ndef ", "\nclass "]
+    max_tokens = 32 if single_line else req.max_tokens
     r = await client.post(LLAMA_URL, json={
         "input_prefix": req.prefix,
         "input_suffix": req.suffix,
-        "n_predict": req.max_tokens,
+        "n_predict": max_tokens,
         "temperature": 0,        # same input -> same suggestion
         "n_probs": 1,            # also return confidence per token
         "cache_prompt": True,
-        "stop": ["\n\n", "\ndef ", "\nclass "],   # stop at a blank line or a new function/class # reuse work from the last request
+        "stop": stop,  # stop at a blank line or a new function/class # reuse work from the last request
     })
     data = r.json()
     logprobs = [token_logprob(t) for t in data.get("completion_probabilities", [])]
