@@ -1,6 +1,7 @@
 package com.github.naveenand.quiettab
 
 import com.google.gson.Gson
+import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.intellij.codeInsight.inline.completion.InlineCompletionEvent
 import com.intellij.codeInsight.inline.completion.InlineCompletionProvider
@@ -11,7 +12,14 @@ import com.intellij.codeInsight.inline.completion.suggestion.InlineCompletionSin
 import com.intellij.codeInsight.inline.completion.suggestion.InlineCompletionSuggestion
 import com.intellij.openapi.application.readAction
 import com.intellij.openapi.diagnostic.thisLogger
+import com.intellij.openapi.project.IndexNotReadyException
+import com.intellij.openapi.roots.ProjectFileIndex
 import com.intellij.psi.PsiComment
+import com.intellij.psi.PsiElement
+import com.intellij.psi.PsiErrorElement
+import com.intellij.psi.PsiFile
+import com.intellij.psi.PsiFileFactory
+import com.intellij.psi.PsiNameIdentifierOwner
 import com.intellij.psi.util.PsiTreeUtil
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.future.await
@@ -21,32 +29,34 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import kotlin.coroutines.cancellation.CancellationException
-import com.intellij.psi.PsiErrorElement
-import com.intellij.psi.PsiFile
-import com.intellij.psi.PsiFileFactory
 
 class QuietTabProvider : InlineCompletionProvider {
     override val id = InlineCompletionProviderID("QuietTab")
 
-    private val http = HttpClient.newBuilder().connectTimeout(Duration.ofMillis(500)).build()
+    // HTTP/1.1: stops uvicorn's "Unsupported upgrade request" warnings
+    private val http = HttpClient.newBuilder()
+        .version(HttpClient.Version.HTTP_1_1)
+        .connectTimeout(Duration.ofMillis(500))
+        .build()
     private val gson = Gson()
 
     // ---- memory between keystrokes ----
-    private val keystrokes = ArrayDeque<Long>()   // times of recent keystrokes (for typing speed)
-    private val outcomes = ArrayDeque<Boolean>()  // last 20 results: true = accepted, false = rejected
+    private val keystrokes = ArrayDeque<Long>()   // times of recent keystrokes (typing speed)
+    private val outcomes = ArrayDeque<Boolean>()  // last 20 results: true = accepted
     @Volatile private var lastShown: Shown? = null
 
     private data class Shown(val offset: Int, val text: String, val info: JsonObject)
+    private data class Snippet(val filename: String, val text: String)
     private data class Ctx(
         val prefix: String, val suffix: String, val cursor: Int,
-        val accepted: Boolean?, val midWord: Boolean, val inComment: Boolean, val ext: String,
+        val accepted: Boolean?, val codeAfter: Boolean, val inComment: Boolean, val ext: String,
     )
 
     override fun isEnabled(event: InlineCompletionEvent): Boolean =
         event is InlineCompletionEvent.DocumentChange
 
     override suspend fun getSuggestion(request: InlineCompletionRequest): InlineCompletionSuggestion {
-        val cps = recordKeystroke(System.currentTimeMillis())   // chars typed in the last second
+        val cps = recordKeystroke(System.currentTimeMillis())
 
         // 1. Read the code, and check: was the LAST suggestion accepted?
         val ctx = readAction {
@@ -60,11 +70,12 @@ class QuietTabProvider : InlineCompletionProvider {
             val restOfLine = text.subSequence(cursor, lineEnd)
             val element = request.file.findElementAt(maxOf(0, cursor - 1))
             Ctx(
-                prefix = text.subSequence(maxOf(0, cursor - 1500), cursor).toString(),
-                suffix = text.subSequence(cursor, minOf(text.length, cursor + 500)).toString(),
+                prefix = text.subSequence(maxOf(0, cursor - PREFIX_CHARS), cursor).toString(),
+                suffix = text.subSequence(cursor, minOf(text.length, cursor + SUFFIX_CHARS)).toString(),
                 cursor = cursor,
                 accepted = accepted,
-                midWord = restOfLine.any { it.isLetterOrDigit() || it == '_' },
+                // real code later on this line (not just ) ] } ; " or spaces) -> don't push text into it
+                codeAfter = restOfLine.any { it.isLetterOrDigit() || it == '_' },
                 inComment = PsiTreeUtil.getParentOfType(element, PsiComment::class.java, false) != null,
                 ext = request.file.virtualFile?.extension ?: "",
             )
@@ -87,7 +98,7 @@ class QuietTabProvider : InlineCompletionProvider {
 
         // 4. Gate 0: skip obviously bad moments without calling the model
         val skip = when {
-            ctx.midWord -> "code_after"
+            ctx.codeAfter -> "code_after"
             ctx.inComment -> "in_comment"
             else -> null
         }
@@ -96,26 +107,31 @@ class QuietTabProvider : InlineCompletionProvider {
             return empty()
         }
 
-        // 5. Ask the model server
-        val res = fetch(ctx.prefix, ctx.suffix) ?: return empty()
+        // 5. Cheat sheet = imports + signatures of things you just used
+        val extra = readAction { collectContext(request.file, request.document.charsSequence, ctx.cursor) }
+        base.addProperty("n_extra", extra.size)
+        base.addProperty("extra_chars", extra.sumOf { it.text.length })
+
+        // 6. Ask the model server
+        val res = fetch(ctx.prefix, ctx.suffix, extra) ?: return empty()
         val text = res.get("text")?.asString.orEmpty()
         if (text.isBlank()) {
             log(base.apply { addProperty("event", "empty") })
             return empty()
         }
-        // Gate 2: drop the suggestion if it adds syntax errors to the file
+
+        // 7. Gate 2: drop the suggestion if it adds syntax errors
         val addsErrors = readAction {
             val doc = request.document.charsSequence
-            if (doc.length > 200_000) false   // skip the check for huge files (speed)
-            else countErrors(request.file, StringBuilder(doc).insert(ctx.cursor, text)) >
-                    countErrors(request.file, doc)
+            if (doc.length > 200_000 || ctx.cursor > doc.length) false
+            else countErrors(request.file, StringBuilder(doc).insert(ctx.cursor, text)) > countErrors(request.file, doc)
         }
         if (addsErrors) {
             log(base.apply { addProperty("event", "dropped_syntax"); addProperty("text", text) })
             return empty()
         }
 
-        // 6. Show it, and remember it so the next keystroke can tell if it was accepted
+        // 8. Show it, and remember it so the next keystroke can tell if it was accepted
         val info = base.apply {
             for (key in listOf("latency_ms", "avg_logprob", "min_logprob", "single_line", "raw_text")) res.get(key)?.let { add(key, it) }
             addProperty("text", text)
@@ -124,6 +140,62 @@ class QuietTabProvider : InlineCompletionProvider {
         log(info.deepCopy().apply { addProperty("event", "shown") })
         lastShown = Shown(ctx.cursor, text, info)
         return InlineCompletionSingleSuggestion.build { emit(InlineCompletionGrayTextElement(text)) }
+    }
+
+    // ---- context (Step 5) ----
+
+    private fun collectContext(file: PsiFile, text: CharSequence, cursor: Int): List<Snippet> = try {
+        val winStart = maxOf(0, cursor - PREFIX_CHARS)
+        val winEnd = minOf(text.length, cursor + SUFFIX_CHARS)
+        val out = LinkedHashMap<String, Snippet>()
+
+        // a) imports at the top of the file, if they're not already inside the window
+        if (winStart > 0) {
+            val imports = text.lineSequence().take(150)
+                .filter { it.startsWith("import ") || it.startsWith("from ") || it.startsWith("package ") }
+                .joinToString("\n")
+            if (imports.isNotBlank()) out["imports"] = Snippet(file.name, imports)
+        }
+
+        // b) names used in the last ~400 chars -> where are they defined? keep the signature
+        val index = ProjectFileIndex.getInstance(file.project)
+        var offset = maxOf(winStart, cursor - 400)
+        while (offset < cursor && out.size < 6) {
+            val leaf = file.findElementAt(offset) ?: break
+            offset = maxOf(leaf.textRange.endOffset, offset + 1)
+            val target = (leaf.parent?.reference ?: leaf.reference)?.resolve() ?: continue
+            val vf = target.containingFile?.virtualFile ?: continue
+            if (!index.isInContent(vf)) continue                                          // only YOUR code
+            val start = target.textRange?.startOffset ?: continue
+            if (target.containingFile == file && start in winStart until winEnd) continue // already visible
+            out.putIfAbsent("${vf.path}:$start", Snippet(vf.name, signatureOf(target)))
+        }
+        out.values.toList()
+    } catch (e: IndexNotReadyException) {
+        emptyList()   // IDE is still indexing: just send no cheat sheet this time
+    }
+
+    // A function -> its header line. A class -> its header + its members' header lines.
+    private fun signatureOf(el: PsiElement): String {
+        val header = headerOf(el)
+        if (!CLASS_LIKE.containsMatchIn(header)) return header
+        val members = PsiTreeUtil.findChildrenOfType(el, PsiNameIdentifierOwner::class.java)
+            .filter { PsiTreeUtil.getParentOfType(it, PsiNameIdentifierOwner::class.java, true) == el }
+            .take(15)
+            .joinToString("\n") { "    " + headerOf(it) }
+        return "$header\n$members".take(1000)
+    }
+
+    // Text up to where the body starts: "{" (Java/Kotlin) or ":" + newline (Python).
+    // Doc comments (/** ... */ and # lines) are removed first so they don't eat the 300-char budget.
+    private fun headerOf(el: PsiElement): String {
+        val t = el.text
+            .replace(Regex("/\\*.*?\\*/", RegexOption.DOT_MATCHES_ALL), "")
+            .lineSequence().filterNot { it.trim().startsWith("//") || it.trim().startsWith("#") }
+            .joinToString("\n")
+        val cut = listOf(t.indexOf('{'), t.indexOf(":\n")).filter { it >= 0 }.minOrNull()
+        val h = if (cut != null) t.substring(0, cut + 1) else t.lineSequence().first()
+        return h.replace(Regex("\\s+"), " ").trim().take(300)
     }
 
     // ---- helpers ----
@@ -147,8 +219,14 @@ class QuietTabProvider : InlineCompletionProvider {
         else (100 + (1 - outcomes.count { it }.toDouble() / outcomes.size) * 400).toLong()
     }
 
-    private suspend fun fetch(prefix: String, suffix: String): JsonObject? {
-        val body = JsonObject().apply { addProperty("prefix", prefix); addProperty("suffix", suffix) }
+    private suspend fun fetch(prefix: String, suffix: String, extra: List<Snippet>): JsonObject? {
+        val body = JsonObject().apply {
+            addProperty("prefix", prefix)
+            addProperty("suffix", suffix)
+            add("extra", JsonArray().apply {
+                extra.forEach { s -> add(JsonObject().apply { addProperty("filename", s.filename); addProperty("text", s.text) }) }
+            })
+        }
         return try {
             val res = http.sendAsync(post("$BASE/complete", body, 1000), HttpResponse.BodyHandlers.ofString()).await()
             if (res.statusCode() != 200) null else gson.fromJson(res.body(), JsonObject::class.java)
@@ -162,7 +240,7 @@ class QuietTabProvider : InlineCompletionProvider {
 
     private fun log(event: JsonObject) {
         event.addProperty("ts", System.currentTimeMillis())
-        http.sendAsync(post("$BASE/log", event, 1000), HttpResponse.BodyHandlers.discarding())  // fire and forget
+        http.sendAsync(post("$BASE/log", event, 1000), HttpResponse.BodyHandlers.discarding())
     }
 
     private fun post(url: String, body: JsonObject, timeoutMs: Long): HttpRequest =
@@ -174,5 +252,8 @@ class QuietTabProvider : InlineCompletionProvider {
 
     companion object {
         const val BASE = "http://localhost:8000"
+        const val PREFIX_CHARS = 1500
+        const val SUFFIX_CHARS = 500
+        private val CLASS_LIKE = Regex("\\b(class|interface|enum|object|record)\\b")
     }
 }

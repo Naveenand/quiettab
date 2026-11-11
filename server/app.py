@@ -21,6 +21,7 @@ class CompleteRequest(BaseModel):
     prefix: str          # code before the cursor
     suffix: str          # code after the cursor
     max_tokens: int = 64
+    extra: list[dict] = []   # [{"filename": "...", "text": "..."}] from the plugin
 
 
 def token_logprob(t: dict) -> float:
@@ -38,6 +39,7 @@ async def complete(req: CompleteRequest):
     stop = ["\n"] if single_line else ["\n\n", "\ndef ", "\nclass "]
     max_tokens = 32 if single_line else req.max_tokens
 
+
     # 1. Ask the model (only llama.cpp settings go here)
     r = await client.post(LLAMA_URL, json={
         "input_prefix": req.prefix,
@@ -47,6 +49,7 @@ async def complete(req: CompleteRequest):
         "n_probs": 1,            # also return confidence per token
         "cache_prompt": True,    # reuse work from the last request
         "stop": stop,
+        "input_extra": req.extra,   # cheat sheet: signatures from other files
     })
     data = r.json()
 
