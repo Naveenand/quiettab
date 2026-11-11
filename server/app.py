@@ -4,7 +4,7 @@ import time
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
-
+from cleanup import clean
 import json
 from pathlib import Path
 
@@ -37,20 +37,27 @@ async def complete(req: CompleteRequest):
     single_line = current_line.strip() != ""            # typing mid-line?
     stop = ["\n"] if single_line else ["\n\n", "\ndef ", "\nclass "]
     max_tokens = 32 if single_line else req.max_tokens
+
+    # 1. Ask the model (only llama.cpp settings go here)
     r = await client.post(LLAMA_URL, json={
         "input_prefix": req.prefix,
         "input_suffix": req.suffix,
         "n_predict": max_tokens,
         "temperature": 0,        # same input -> same suggestion
         "n_probs": 1,            # also return confidence per token
-        "cache_prompt": True,
-        "single_line": single_line,
-        "stop": stop,  # stop at a blank line or a new function/class # reuse work from the last request
+        "cache_prompt": True,    # reuse work from the last request
+        "stop": stop,
     })
     data = r.json()
+
+    # 2. Confidence from per-token logprobs
     logprobs = [token_logprob(t) for t in data.get("completion_probabilities", [])]
+
+    # 3. Reply to the plugin (cleaned text + raw text for debugging)
     return {
-        "text": data["content"],
+        "text": clean(data["content"], req.prefix, req.suffix, single_line),
+        "raw_text": data["content"],
+        "single_line": single_line,
         "avg_logprob": sum(logprobs) / len(logprobs) if logprobs else None,
         "min_logprob": min(logprobs) if logprobs else None,
         "latency_ms": round((time.perf_counter() - start) * 1000),

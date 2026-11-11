@@ -21,6 +21,9 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import kotlin.coroutines.cancellation.CancellationException
+import com.intellij.psi.PsiErrorElement
+import com.intellij.psi.PsiFile
+import com.intellij.psi.PsiFileFactory
 
 class QuietTabProvider : InlineCompletionProvider {
     override val id = InlineCompletionProviderID("QuietTab")
@@ -92,7 +95,7 @@ class QuietTabProvider : InlineCompletionProvider {
             log(base.apply { addProperty("event", "skipped"); addProperty("reason", skip) })
             return empty()
         }
-        
+
         // 5. Ask the model server
         val res = fetch(ctx.prefix, ctx.suffix) ?: return empty()
         val text = res.get("text")?.asString.orEmpty()
@@ -100,10 +103,21 @@ class QuietTabProvider : InlineCompletionProvider {
             log(base.apply { addProperty("event", "empty") })
             return empty()
         }
+        // Gate 2: drop the suggestion if it adds syntax errors to the file
+        val addsErrors = readAction {
+            val doc = request.document.charsSequence
+            if (doc.length > 200_000) false   // skip the check for huge files (speed)
+            else countErrors(request.file, StringBuilder(doc).insert(ctx.cursor, text)) >
+                    countErrors(request.file, doc)
+        }
+        if (addsErrors) {
+            log(base.apply { addProperty("event", "dropped_syntax"); addProperty("text", text) })
+            return empty()
+        }
 
         // 6. Show it, and remember it so the next keystroke can tell if it was accepted
         val info = base.apply {
-            for (key in listOf("latency_ms", "avg_logprob", "min_logprob", "single_line")) res.get(key)?.let { add(key, it) }
+            for (key in listOf("latency_ms", "avg_logprob", "min_logprob", "single_line", "raw_text")) res.get(key)?.let { add(key, it) }
             addProperty("text", text)
             addProperty("text_len", text.length)
         }
@@ -114,6 +128,12 @@ class QuietTabProvider : InlineCompletionProvider {
 
     // ---- helpers ----
     private fun empty() = InlineCompletionSingleSuggestion.build { }
+
+    // Parse a copy of the file with IntelliJ's own parser and count syntax errors
+    private fun countErrors(file: PsiFile, text: CharSequence): Int {
+        val copy = PsiFileFactory.getInstance(file.project).createFileFromText(file.name, file.language, text)
+        return PsiTreeUtil.findChildrenOfType(copy, PsiErrorElement::class.java).size
+    }
 
     private fun recordKeystroke(now: Long): Int = synchronized(keystrokes) {
         keystrokes.addLast(now)
