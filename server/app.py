@@ -5,6 +5,12 @@ import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+import json
+from pathlib import Path
+
+LOG_PATH = Path(__file__).parent / "logs" / "events.jsonl"
+LOG_PATH.parent.mkdir(exist_ok=True)
+
 LLAMA_URL = "http://localhost:8012/infill"
 
 app = FastAPI()
@@ -38,6 +44,7 @@ async def complete(req: CompleteRequest):
         "temperature": 0,        # same input -> same suggestion
         "n_probs": 1,            # also return confidence per token
         "cache_prompt": True,
+        "single_line": single_line,
         "stop": stop,  # stop at a blank line or a new function/class # reuse work from the last request
     })
     data = r.json()
@@ -48,3 +55,8 @@ async def complete(req: CompleteRequest):
         "min_logprob": min(logprobs) if logprobs else None,
         "latency_ms": round((time.perf_counter() - start) * 1000),
     }
+@app.post("/log")
+async def log_event(event: dict):
+    with LOG_PATH.open("a") as f:
+        f.write(json.dumps(event) + "\n")
+    return {"ok": True}
