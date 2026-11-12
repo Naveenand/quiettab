@@ -2,6 +2,11 @@ package com.github.naveenand.quiettab
 import com.google.gson.Gson
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
+import kotlinx.coroutines.suspendCancellableCoroutine
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CompletionException
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import com.intellij.codeInsight.inline.completion.InlineCompletion
 import com.intellij.codeInsight.inline.completion.InlineCompletionEvent
 import com.intellij.codeInsight.inline.completion.InlineCompletionEventAdapter
@@ -33,6 +38,7 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.Collections
 import java.util.WeakHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.coroutines.cancellation.CancellationException
 
 class QuietTabProvider : InlineCompletionProvider {
@@ -50,6 +56,7 @@ class QuietTabProvider : InlineCompletionProvider {
     private val outcomes = ArrayDeque<Boolean>()  // last 20 results: true = accepted
     @Volatile private var lastShown: Shown? = null
     @Volatile private var lastGated: Shown? = null   // last suggestion the gate hid
+    private val dropped = CopyOnWriteArrayList<Shown>()  // shown, then dropped by the IDE (e.g. auto-bracket); max 4
     @Volatile private var shownAt = 0L               // when the current gray text appeared
     @Volatile private var partialChars = 0           // chars taken word-by-word (Ctrl+Right)
     private val watched = Collections.synchronizedSet(Collections.newSetFromMap(WeakHashMap<Editor, Boolean>()))
@@ -76,6 +83,9 @@ class QuietTabProvider : InlineCompletionProvider {
                 addProperty("partial_chars", partialChars)
                 addProperty("shown_ms", System.currentTimeMillis() - shownAt)
             })
+            if (outcome == "rejected" && finish == "INVALIDATED") {   // maybe the user keeps typing it anyway
+                dropped.add(s); while (dropped.size > 4) dropped.removeAt(0)
+            }
             synchronized(outcomes) { outcomes.addLast(outcome != "rejected"); if (outcomes.size > 20) outcomes.removeFirst() }
             partialChars = 0
         }
@@ -88,6 +98,7 @@ class QuietTabProvider : InlineCompletionProvider {
         val codeAfter: Boolean, val inComment: Boolean, val ext: String,
         val throughGated: Boolean,
         val gatedTyped: Boolean,
+        val drops: List<Pair<Shown, Int>>,   // each dropped suggestion -> -1 not following, 0 still typing it, >0 chars followed
     )
 
     override fun isEnabled(event: InlineCompletionEvent): Boolean =
@@ -117,6 +128,20 @@ class QuietTabProvider : InlineCompletionProvider {
                 cursor - g.offset == g.text.length &&
                         text.subSequence(g.offset, cursor).toString() == g.text
             } ?: false
+            fun followState(d: Shown): Int {
+                val typed = cursor - d.offset
+                val firstLine = d.text.substringBefore('\n')
+                fun docHas(t: String) = d.offset >= 0 && d.offset + t.length <= text.length &&
+                        text.subSequence(d.offset, d.offset + t.length).toString() == t
+                return when {
+                    typed <= 0 -> -1
+                    docHas(d.text) -> d.text.length                         // whole suggestion is in the file
+                    firstLine.length < d.text.length && typed > firstLine.length && docHas(firstLine) -> firstLine.length  // typed its first line, moved on
+                    typed <= d.text.length && text.subSequence(d.offset, cursor).toString() == d.text.substring(0, typed) -> 0  // still following
+                    else -> -1                                               // went a different way
+                }
+            }
+            val drops = dropped.map { it to followState(it) }
             Ctx(
                 prefix = text.subSequence(maxOf(0, cursor - PREFIX_CHARS), cursor).toString(),
                 suffix = text.subSequence(cursor, minOf(text.length, cursor + SUFFIX_CHARS)).toString(),
@@ -127,7 +152,14 @@ class QuietTabProvider : InlineCompletionProvider {
                 ext = request.file.virtualFile?.extension ?: "",
                 throughGated = throughGated,
                 gatedTyped = gatedTyped,
+                drops = drops,
             )
+        }
+
+        // Fix 8b: dropped by the IDE (e.g. auto-bracket) but the user typed it anyway -> it was a hit
+        for ((d, st) in ctx.drops) {
+            if (st > 0) log(d.info.deepCopy().apply { addProperty("event", "followed"); addProperty("followed_chars", st) })
+            if (st != 0) dropped.remove(d)   // done or abandoned; a newer drop added meanwhile is kept
         }
 
         // 2. (accept/reject is now logged by outcomeListener, from the IDE's own events)
@@ -145,6 +177,7 @@ class QuietTabProvider : InlineCompletionProvider {
 
         val base = JsonObject().apply {
             addProperty("ext", ctx.ext); addProperty("cps", cps); addProperty("delay_ms", waitMs)
+            addProperty("drops_following", ctx.drops.count { it.second == 0 })   // DEBUG Fix 8b
         }
 
         // 4. Gate 0: skip obviously bad moments without calling the model
@@ -267,6 +300,15 @@ class QuietTabProvider : InlineCompletionProvider {
         val h = if (cut != null) t.substring(0, cut + 1) else t.lineSequence().first()
         return h.replace(Regex("\\s+"), " ").trim().take(300)
     }
+    // Like .await(), but when the user types again it REALLY aborts the HTTP request (cancel(true)),
+    // so the server sees the hang-up and stops the model (Fix 11b)
+    private suspend fun <T> CompletableFuture<T>.awaitOrAbort(): T = suspendCancellableCoroutine { cont ->
+        whenComplete { value, error ->
+            if (error == null) cont.resume(value)
+            else cont.resumeWithException((error as? CompletionException)?.cause ?: error)
+        }
+        cont.invokeOnCancellation { cancel(true) }
+    }
 
     // ---- helpers ----
     private fun empty() = InlineCompletionSingleSuggestion.build { }
@@ -298,7 +340,7 @@ class QuietTabProvider : InlineCompletionProvider {
             })
         }
         return try {
-            val res = http.sendAsync(post("$BASE/complete", body, 1000), HttpResponse.BodyHandlers.ofString()).await()
+            val res = http.sendAsync(post("$BASE/complete", body, 1000), HttpResponse.BodyHandlers.ofString()).awaitOrAbort()
             if (res.statusCode() != 200) null else gson.fromJson(res.body(), JsonObject::class.java)
         } catch (e: CancellationException) {
             throw e

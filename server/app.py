@@ -1,18 +1,18 @@
+import asyncio
 import json
 import math
 import os
 import time
 from pathlib import Path
-from pydantic import BaseModel, Field
+
 import httpx
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, Request, Response
+from pydantic import BaseModel, Field
 
 from cleanup import clean
 
 LOG_PATH = Path(__file__).parent / "logs" / "events.jsonl"
 LOG_PATH.parent.mkdir(exist_ok=True)
-
 DEBUG = os.getenv("QT_DEBUG") == "1"
 PROMPT_LOG = LOG_PATH.parent / "prompts.jsonl"
 
@@ -23,7 +23,41 @@ GATE_PATH = Path(__file__).parent / "gate.json"
 GATE = json.loads(GATE_PATH.read_text()) if GATE_PATH.exists() else None
 
 app = FastAPI()
-client = httpx.AsyncClient(timeout=2.0)
+client = httpx.AsyncClient(timeout=1.0)     # same 1 s budget as the plugin
+
+# Fix 11: count suggestions we stopped early, and model failures
+STATS = {"cancelled": 0, "llama_errors": 0}
+
+
+async def ask_llama(request: Request, payload: dict):
+    """Call llama-server, but stop it if the plugin hangs up first (= the user typed again)."""
+    async def call():
+        r = await client.post(LLAMA_URL, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    async def hung_up():
+        while not await request.is_disconnected():
+            await asyncio.sleep(0.02)
+
+    llama, gone = asyncio.create_task(call()), asyncio.create_task(hung_up())
+    done, _ = await asyncio.wait({llama, gone}, return_when=asyncio.FIRST_COMPLETED)
+    if llama not in done:            # plugin gave up -> cancel = close connection -> llama stops too
+        llama.cancel()
+        STATS["cancelled"] += 1
+        return None
+    gone.cancel()
+    try:
+        return llama.result()
+    except Exception as e:           # llama down / timeout / bad reply: say why instead of a bare 500
+        STATS["llama_errors"] += 1
+        print(f"[quiettab] llama error: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+@app.get("/stats")
+async def stats():
+    return STATS
 
 
 class CompleteRequest(BaseModel):
@@ -51,7 +85,7 @@ def p_good(avg, mn, text, single_line, has_extra):
 
 
 @app.post("/complete")
-async def complete(req: CompleteRequest):
+async def complete(req: CompleteRequest, request: Request):
     start = time.perf_counter()
     current_line = req.prefix.rsplit("\n", 1)[-1]      # text before the cursor on this line
     single_line = current_line.strip() != ""            # typing mid-line?
@@ -60,7 +94,7 @@ async def complete(req: CompleteRequest):
     extra = [{**e, "text": e.get("text", "").rstrip("\n") + "\n"} for e in req.extra]
 
     # 1. Ask the model (only llama.cpp settings go here)
-    r = await client.post(LLAMA_URL, json={
+    data = await ask_llama(request, payload={
         "input_prefix": req.prefix,
         "input_suffix": req.suffix,
         "n_predict": max_tokens,
@@ -70,7 +104,9 @@ async def complete(req: CompleteRequest):
         "stop": stop,
         "input_extra": extra,    # cheat sheet: signatures from other files
     })
-    data = r.json()
+    if data is None:                 # plugin hung up, or llama failed (reason printed in this terminal)
+        return Response(status_code=503)
+
     if DEBUG:
         prompt = data.get("prompt") or ""
         with PROMPT_LOG.open("a") as f:
@@ -107,7 +143,7 @@ async def complete(req: CompleteRequest):
         "min_logprob": mn,
         "latency_ms": round((time.perf_counter() - start) * 1000),
         "p_good": p,                                       # NEW: how likely it's good
-        "show": p is None or p >= thr,       # NEW: the gate's decision
+        "show": (p >= thr) if p is not None else GATE is None,   # no confidence -> stay quiet
         "is_block": is_block,
     }
 
