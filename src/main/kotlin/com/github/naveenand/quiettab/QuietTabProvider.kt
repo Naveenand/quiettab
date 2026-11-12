@@ -43,12 +43,14 @@ class QuietTabProvider : InlineCompletionProvider {
     private val keystrokes = ArrayDeque<Long>()   // times of recent keystrokes (typing speed)
     private val outcomes = ArrayDeque<Boolean>()  // last 20 results: true = accepted
     @Volatile private var lastShown: Shown? = null
+    @Volatile private var lastGated: Shown? = null   // last suggestion the gate hid
 
     private data class Shown(val offset: Int, val text: String, val info: JsonObject)
     private data class Snippet(val filename: String, val text: String)
     private data class Ctx(
         val prefix: String, val suffix: String, val cursor: Int,
         val accepted: Boolean?, val codeAfter: Boolean, val inComment: Boolean, val ext: String,
+        val throughGated: Boolean,
     )
 
     override fun isEnabled(event: InlineCompletionEvent): Boolean =
@@ -69,6 +71,12 @@ class QuietTabProvider : InlineCompletionProvider {
             val lineEnd = text.indexOf('\n', cursor).let { if (it == -1) text.length else it }
             val restOfLine = text.subSequence(cursor, lineEnd)
             val element = request.file.findElementAt(maxOf(0, cursor - 1))
+            // is the user typing exactly what the gate just hid?
+            val throughGated = lastGated?.let { g ->
+                val typed = cursor - g.offset
+                typed in 1 until g.text.length &&
+                        text.subSequence(g.offset, cursor).toString() == g.text.substring(0, typed)
+            } ?: false
             Ctx(
                 prefix = text.subSequence(maxOf(0, cursor - PREFIX_CHARS), cursor).toString(),
                 suffix = text.subSequence(cursor, minOf(text.length, cursor + SUFFIX_CHARS)).toString(),
@@ -78,6 +86,7 @@ class QuietTabProvider : InlineCompletionProvider {
                 codeAfter = restOfLine.any { it.isLetterOrDigit() || it == '_' },
                 inComment = PsiTreeUtil.getParentOfType(element, PsiComment::class.java, false) != null,
                 ext = request.file.virtualFile?.extension ?: "",
+                throughGated = throughGated,
             )
         }
 
@@ -87,6 +96,12 @@ class QuietTabProvider : InlineCompletionProvider {
             lastShown = null
             synchronized(outcomes) { outcomes.addLast(acc); if (outcomes.size > 20) outcomes.removeFirst() }
         }
+        // 2b. Typing through a suggestion the gate already hid -> it would stay hidden; skip the model call
+        if (ctx.throughGated) {
+            log(JsonObject().apply { addProperty("ext", ctx.ext); addProperty("event", "skipped"); addProperty("reason", "typing_through_gated") })
+            return empty()
+        }
+        lastGated = null
 
         // 3. Adaptive wait. Typing again cancels this call (= debounce + cancel stale)
         val waitMs = currentDelay()
@@ -127,6 +142,7 @@ class QuietTabProvider : InlineCompletionProvider {
                 res.get("avg_logprob")?.let { add("avg_logprob", it) }
                 addProperty("text", text)
             })
+            lastGated = Shown(ctx.cursor, text, base)
             return empty()
         }
 
