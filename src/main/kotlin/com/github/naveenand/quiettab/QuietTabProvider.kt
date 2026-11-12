@@ -119,6 +119,16 @@ class QuietTabProvider : InlineCompletionProvider {
             log(base.apply { addProperty("event", "empty") })
             return empty()
         }
+        // 6b. Gate 1 (Phase 7): the server's confidence gate says "stay quiet"
+        if (res.get("show")?.asBoolean == false) {
+            log(base.apply {
+                addProperty("event", "gated")
+                res.get("p_good")?.let { add("p_good", it) }
+                res.get("avg_logprob")?.let { add("avg_logprob", it) }
+                addProperty("text", text)
+            })
+            return empty()
+        }
 
         // 7. Gate 2: drop the suggestion if it adds syntax errors
         val addsErrors = readAction {
@@ -133,7 +143,7 @@ class QuietTabProvider : InlineCompletionProvider {
 
         // 8. Show it, and remember it so the next keystroke can tell if it was accepted
         val info = base.apply {
-            for (key in listOf("latency_ms", "avg_logprob", "min_logprob", "single_line", "raw_text")) res.get(key)?.let { add(key, it) }
+            for (key in listOf("latency_ms", "avg_logprob", "min_logprob", "single_line", "raw_text", "p_good")) res.get(key)?.let { add(key, it) }
             addProperty("text", text)
             addProperty("text_len", text.length)
         }

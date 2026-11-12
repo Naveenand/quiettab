@@ -6,8 +6,8 @@
     3.0719
   ],
   "intercept": 0.2905,
-  "threshold": 0.437,
-  "target_precision": 0.7,
+  "threshold": 0.3999,
+  "target_precision": 0.6,
   "good_definition": "exact match OR (valid AND chrF >= 70)",
   "trained_on": 235
 }
