@@ -2,7 +2,10 @@ package com.github.naveenand.quiettab
 import com.google.gson.Gson
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
+import com.intellij.codeInsight.inline.completion.InlineCompletion
 import com.intellij.codeInsight.inline.completion.InlineCompletionEvent
+import com.intellij.codeInsight.inline.completion.InlineCompletionEventAdapter
+import com.intellij.codeInsight.inline.completion.InlineCompletionEventType
 import com.intellij.codeInsight.inline.completion.InlineCompletionProvider
 import com.intellij.codeInsight.inline.completion.InlineCompletionProviderID
 import com.intellij.codeInsight.inline.completion.InlineCompletionRequest
@@ -11,6 +14,7 @@ import com.intellij.codeInsight.inline.completion.suggestion.InlineCompletionSin
 import com.intellij.codeInsight.inline.completion.suggestion.InlineCompletionSuggestion
 import com.intellij.openapi.application.readAction
 import com.intellij.openapi.diagnostic.thisLogger
+import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.project.IndexNotReadyException
 import com.intellij.openapi.roots.ProjectFileIndex
 import com.intellij.psi.PsiComment
@@ -27,6 +31,8 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
+import java.util.Collections
+import java.util.WeakHashMap
 import kotlin.coroutines.cancellation.CancellationException
 
 class QuietTabProvider : InlineCompletionProvider {
@@ -44,12 +50,42 @@ class QuietTabProvider : InlineCompletionProvider {
     private val outcomes = ArrayDeque<Boolean>()  // last 20 results: true = accepted
     @Volatile private var lastShown: Shown? = null
     @Volatile private var lastGated: Shown? = null   // last suggestion the gate hid
+    @Volatile private var shownAt = 0L               // when the current gray text appeared
+    @Volatile private var partialChars = 0           // chars taken word-by-word (Ctrl+Right)
+    private val watched = Collections.synchronizedSet(Collections.newSetFromMap(WeakHashMap<Editor, Boolean>()))
+
+    // Fix 8: the IDE tells us exactly what happened to the gray text (Tab, typed it, Esc, moved away...)
+    private val outcomeListener = object : InlineCompletionEventAdapter {
+        override fun onChange(event: InlineCompletionEventType.Change) {
+            // lengthChange < 0 = gray text got shorter; count it only for word-by-word accepts
+            if (lastShown != null && event.event is InlineCompletionEvent.PartialAccept) partialChars -= event.lengthChange
+        }
+
+        override fun onHide(event: InlineCompletionEventType.Hide) {
+            val s = lastShown ?: return
+            lastShown = null
+            val finish = event.finishType.name
+            val outcome = when (finish) {
+                "SELECTED" -> "accepted"            // Tab
+                "TYPED" -> "typed_through"          // typed the whole suggestion by hand
+                else -> if (partialChars > 0) "partial" else "rejected"
+            }
+            log(s.info.deepCopy().apply {
+                addProperty("event", outcome)
+                addProperty("finish", finish)      // ESCAPE_PRESSED, INVALIDATED, CARET_CHANGED, ...
+                addProperty("partial_chars", partialChars)
+                addProperty("shown_ms", System.currentTimeMillis() - shownAt)
+            })
+            synchronized(outcomes) { outcomes.addLast(outcome != "rejected"); if (outcomes.size > 20) outcomes.removeFirst() }
+            partialChars = 0
+        }
+    }
 
     private data class Shown(val offset: Int, val text: String, val info: JsonObject)
     private data class Snippet(val filename: String, val text: String)
     private data class Ctx(
         val prefix: String, val suffix: String, val cursor: Int,
-        val accepted: Boolean?, val codeAfter: Boolean, val inComment: Boolean, val ext: String,
+        val codeAfter: Boolean, val inComment: Boolean, val ext: String,
         val throughGated: Boolean,
     )
 
@@ -58,16 +94,13 @@ class QuietTabProvider : InlineCompletionProvider {
 
     override suspend fun getSuggestion(request: InlineCompletionRequest): InlineCompletionSuggestion {
         if (isSensitive(request.file.virtualFile?.name.orEmpty())) return empty()   // never send or log secrets
+        if (watched.add(request.editor)) InlineCompletion.getHandlerOrNull(request.editor)?.addEventListener(outcomeListener)
         val cps = recordKeystroke(System.currentTimeMillis())
 
-        // 1. Read the code, and check: was the LAST suggestion accepted?
+        // 1. Read the code around the cursor
         val ctx = readAction {
             val text = request.document.charsSequence
             val cursor = request.endOffset
-            val accepted = lastShown?.let { s ->
-                val end = s.offset + s.text.length
-                end <= text.length && text.subSequence(s.offset, end).toString() == s.text
-            }
             val lineEnd = text.indexOf('\n', cursor).let { if (it == -1) text.length else it }
             val restOfLine = text.subSequence(cursor, lineEnd)
             val element = request.file.findElementAt(maxOf(0, cursor - 1))
@@ -81,7 +114,6 @@ class QuietTabProvider : InlineCompletionProvider {
                 prefix = text.subSequence(maxOf(0, cursor - PREFIX_CHARS), cursor).toString(),
                 suffix = text.subSequence(cursor, minOf(text.length, cursor + SUFFIX_CHARS)).toString(),
                 cursor = cursor,
-                accepted = accepted,
                 // real code later on this line (not just ) ] } ; " or spaces) -> don't push text into it
                 codeAfter = restOfLine.any { it.isLetterOrDigit() || it == '_' },
                 inComment = PsiTreeUtil.getParentOfType(element, PsiComment::class.java, false) != null,
@@ -90,12 +122,7 @@ class QuietTabProvider : InlineCompletionProvider {
             )
         }
 
-        // 2. Log the previous suggestion's result (once)
-        ctx.accepted?.let { acc ->
-            lastShown?.let { log(it.info.deepCopy().apply { addProperty("event", if (acc) "accepted" else "rejected") }) }
-            lastShown = null
-            synchronized(outcomes) { outcomes.addLast(acc); if (outcomes.size > 20) outcomes.removeFirst() }
-        }
+        // 2. (accept/reject is now logged by outcomeListener, from the IDE's own events)
         // 2b. Typing through a suggestion the gate already hid -> it would stay hidden; skip the model call
         if (ctx.throughGated) {
             log(JsonObject().apply { addProperty("ext", ctx.ext); addProperty("event", "skipped"); addProperty("reason", "typing_through_gated") })
@@ -157,13 +184,14 @@ class QuietTabProvider : InlineCompletionProvider {
             return empty()
         }
 
-        // 8. Show it, and remember it so the next keystroke can tell if it was accepted
+        // 8. Show it, and remember it so outcomeListener can log what happened to it
         val info = base.apply {
             for (key in listOf("latency_ms", "avg_logprob", "min_logprob", "single_line", "raw_text", "p_good")) res.get(key)?.let { add(key, it) }
             addProperty("text", text)
             addProperty("text_len", text.length)
         }
         log(info.deepCopy().apply { addProperty("event", "shown") })
+        shownAt = System.currentTimeMillis(); partialChars = 0
         lastShown = Shown(ctx.cursor, text, info)
         return InlineCompletionSingleSuggestion.build { emit(InlineCompletionGrayTextElement(text)) }
     }
