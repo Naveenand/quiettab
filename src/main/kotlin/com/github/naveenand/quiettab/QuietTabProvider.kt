@@ -87,6 +87,7 @@ class QuietTabProvider : InlineCompletionProvider {
         val prefix: String, val suffix: String, val cursor: Int,
         val codeAfter: Boolean, val inComment: Boolean, val ext: String,
         val throughGated: Boolean,
+        val gatedTyped: Boolean,
     )
 
     override fun isEnabled(event: InlineCompletionEvent): Boolean =
@@ -111,6 +112,11 @@ class QuietTabProvider : InlineCompletionProvider {
                 typed in 1 until g.text.length &&
                         text.subSequence(g.offset, cursor).toString() == g.text.substring(0, typed)
             } ?: false
+            // did the user just finish typing a suggestion the gate hid? (= the gate missed a good one)
+            val gatedTyped = lastGated?.let { g ->
+                cursor - g.offset == g.text.length &&
+                        text.subSequence(g.offset, cursor).toString() == g.text
+            } ?: false
             Ctx(
                 prefix = text.subSequence(maxOf(0, cursor - PREFIX_CHARS), cursor).toString(),
                 suffix = text.subSequence(cursor, minOf(text.length, cursor + SUFFIX_CHARS)).toString(),
@@ -120,6 +126,7 @@ class QuietTabProvider : InlineCompletionProvider {
                 inComment = PsiTreeUtil.getParentOfType(element, PsiComment::class.java, false) != null,
                 ext = request.file.virtualFile?.extension ?: "",
                 throughGated = throughGated,
+                gatedTyped = gatedTyped,
             )
         }
 
@@ -129,6 +136,7 @@ class QuietTabProvider : InlineCompletionProvider {
             log(JsonObject().apply { addProperty("ext", ctx.ext); addProperty("event", "skipped"); addProperty("reason", "typing_through_gated") })
             return empty()
         }
+        if (ctx.gatedTyped) lastGated?.let { g -> log(g.info.deepCopy().apply { addProperty("event", "gated_typed") }) }
         lastGated = null
 
         // 3. Adaptive wait. Typing again cancels this call (= debounce + cancel stale)
