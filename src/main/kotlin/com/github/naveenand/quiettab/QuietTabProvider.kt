@@ -56,6 +56,7 @@ class QuietTabProvider : InlineCompletionProvider {
         event is InlineCompletionEvent.DocumentChange
 
     override suspend fun getSuggestion(request: InlineCompletionRequest): InlineCompletionSuggestion {
+        if (isSensitive(request.file.virtualFile?.name.orEmpty())) return empty()   // never send or log secrets
         val cps = recordKeystroke(System.currentTimeMillis())
 
         // 1. Read the code, and check: was the LAST suggestion accepted?
@@ -265,5 +266,7 @@ class QuietTabProvider : InlineCompletionProvider {
         const val PREFIX_CHARS = 1500
         const val SUFFIX_CHARS = 500
         private val CLASS_LIKE = Regex("\\b(class|interface|enum|object|record)\\b")
+        private val SECRET_NAMES = Regex("""(?i)^\.env(\..*)?$|\.(pem|key|p12|pfx|jks|keystore)$|secret|credential|id_rsa""")
+        fun isSensitive(name: String) = SECRET_NAMES.containsMatchIn(name)
     }
 }
