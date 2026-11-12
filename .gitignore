@@ -6,3 +6,15 @@
 build
 
 server/logs/
+
+eval/repos/
+eval/data/
+eval/results/*.jsonl
+
+eval/repos2/
+eval/results/holdout*
+
+__pycache__/
+*.pyc
+**/prompts.jsonl
+**/events.jsonl
