@@ -3,7 +3,7 @@ import math
 import os
 import time
 from pathlib import Path
-
+from pydantic import BaseModel, Field
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -27,10 +27,10 @@ client = httpx.AsyncClient(timeout=2.0)
 
 
 class CompleteRequest(BaseModel):
-    prefix: str          # code before the cursor
-    suffix: str          # code after the cursor
-    max_tokens: int = 64
-    extra: list[dict] = []   # [{"filename": "...", "text": "..."}] from the plugin
+    prefix: str = Field(max_length=8000)
+    suffix: str = Field(max_length=4000)
+    max_tokens: int = Field(64, ge=1, le=128)
+    extra: list[dict] = Field(default_factory=list, max_length=8)
 
 
 def token_logprob(t: dict) -> float:
@@ -108,6 +108,8 @@ async def complete(req: CompleteRequest):
 
 @app.post("/log")
 async def log_event(event: dict):
+    if LOG_PATH.exists() and LOG_PATH.stat().st_size > 50_000_000:   # 50 MB cap
+        return {"ok": False, "reason": "log full"}
     with LOG_PATH.open("a") as f:
         f.write(json.dumps(event) + "\n")
     return {"ok": True}
