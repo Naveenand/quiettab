@@ -93,9 +93,10 @@ async def complete(req: CompleteRequest):
     text = clean(data["content"], req.prefix, req.suffix, single_line)
     p = p_good(avg, mn, text, single_line, bool(req.extra))
 
+    is_block = "\n" in text            # the SUGGESTION has several lines
     thr = None
     if GATE:
-        thr = GATE["threshold"] if single_line else GATE.get("block_threshold", GATE["threshold"])
+        thr = GATE.get("block_threshold", GATE["threshold"]) if is_block else GATE["threshold"]
 
     # 4. Reply to the plugin
     return {
@@ -107,6 +108,7 @@ async def complete(req: CompleteRequest):
         "latency_ms": round((time.perf_counter() - start) * 1000),
         "p_good": p,                                       # NEW: how likely it's good
         "show": p is None or p >= thr,       # NEW: the gate's decision
+        "is_block": is_block,
     }
 
 

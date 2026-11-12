@@ -93,9 +93,10 @@ class QuietTabProvider : InlineCompletionProvider {
         event is InlineCompletionEvent.DocumentChange
 
     override suspend fun getSuggestion(request: InlineCompletionRequest): InlineCompletionSuggestion {
+        val t0 = System.currentTimeMillis()                                          // Fix 9: start the stopwatch
         if (isSensitive(request.file.virtualFile?.name.orEmpty())) return empty()   // never send or log secrets
         if (watched.add(request.editor)) InlineCompletion.getHandlerOrNull(request.editor)?.addEventListener(outcomeListener)
-        val cps = recordKeystroke(System.currentTimeMillis())
+        val cps = recordKeystroke(t0)
 
         // 1. Read the code around the cursor
         val ctx = readAction {
@@ -150,12 +151,16 @@ class QuietTabProvider : InlineCompletionProvider {
         }
 
         // 5. Cheat sheet = imports + signatures of things you just used
+        val tCtx = System.currentTimeMillis()
         val extra = readAction { collectContext(request.file, request.document.charsSequence, ctx.cursor) }
+        base.addProperty("ctx_ms", System.currentTimeMillis() - tCtx)
         base.addProperty("n_extra", extra.size)
         base.addProperty("extra_chars", extra.sumOf { it.text.length })
 
         // 6. Ask the model server
+        val tFetch = System.currentTimeMillis()
         val res = fetch(ctx.prefix, ctx.suffix, extra) ?: return empty()
+        base.addProperty("rtt_ms", System.currentTimeMillis() - tFetch)   // plugin -> server -> plugin
         val text = res.get("text")?.asString.orEmpty()
         if (text.isBlank()) {
             log(base.apply { addProperty("event", "empty") })
@@ -174,11 +179,13 @@ class QuietTabProvider : InlineCompletionProvider {
         }
 
         // 7. Gate 2: drop the suggestion if it adds syntax errors
+        val tG2 = System.currentTimeMillis()
         val addsErrors = readAction {
             val doc = request.document.charsSequence
             if (doc.length > 200_000 || ctx.cursor > doc.length) false
             else countErrors(request.file, StringBuilder(doc).insert(ctx.cursor, text)) > countErrors(request.file, doc)
         }
+        base.addProperty("gate2_ms", System.currentTimeMillis() - tG2)
         if (addsErrors) {
             log(base.apply { addProperty("event", "dropped_syntax"); addProperty("text", text) })
             return empty()
@@ -189,6 +196,7 @@ class QuietTabProvider : InlineCompletionProvider {
             for (key in listOf("latency_ms", "avg_logprob", "min_logprob", "single_line", "raw_text", "p_good")) res.get(key)?.let { add(key, it) }
             addProperty("text", text)
             addProperty("text_len", text.length)
+            addProperty("e2e_ms", System.currentTimeMillis() - t0)   // Fix 9: IDE asks -> gray text ready
         }
         log(info.deepCopy().apply { addProperty("event", "shown") })
         shownAt = System.currentTimeMillis(); partialChars = 0
