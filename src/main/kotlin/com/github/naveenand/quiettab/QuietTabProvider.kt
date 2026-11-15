@@ -344,7 +344,7 @@ class QuietTabProvider : InlineCompletionProvider {
     // 150 ms until we have 5 results; then 100 ms (accept everything) ... 500 ms (reject everything)
     private fun currentDelay(): Long = synchronized(outcomes) {
         if (outcomes.size < 5) 150L
-        else (100 + (1 - outcomes.count { it }.toDouble() / outcomes.size) * 400).toLong()
+        else (100 + (1 - outcomes.count { it }.toDouble() / outcomes.size) * 200).toLong()
     }
 
     private suspend fun fetch(prefix: String, suffix: String, extra: List<Snippet>): JsonObject? {
