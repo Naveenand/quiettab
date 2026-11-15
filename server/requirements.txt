@@ -1,0 +1,5 @@
+# QuietTab model server (Python 3.10+, tested on 3.14)
+fastapi==0.162.3
+uvicorn==0.54.0
+httpx==0.28.1
+pydantic==2.14.3

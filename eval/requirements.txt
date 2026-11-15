@@ -1,0 +1,8 @@
+# QuietTab evaluation scripts (run from the eval/ folder)
+-r ../server/requirements.txt
+sacrebleu==2.6.0       # chrF metric
+scikit-learn==1.9.1    # confidence gate (logistic regression)
+numpy==2.5.4
+matplotlib==3.11.2     # accuracy-rejection curve (results/arc.png)
+datasets==5.2.0        # import_realfim.py (Real-FIM-Eval from Hugging Face)
+tqdm==4.70.1
