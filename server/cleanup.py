@@ -1,16 +1,64 @@
 OPEN, CLOSE = "([{", ")]}"
+QUOTES = "\"'"
 MAX_LINES = 8          # block mode: never suggest more than this many lines
 MIN_REPEAT_CHARS = 15  # ignore tiny suggestions like "}" or "i++;" in the repeat check
 
 
-def cut_at_suffix_closer(text: str, suffix: str) -> str:
+# Fix 14: brackets inside strings, like print("("), must not count as real brackets.
+def open_quote(line: str) -> str | None:
+    """Which quote (' or ") is still open at the end of this line, if any. e.g. 'print("hel' -> '"'."""
+    quote, escaped = None, False
+    for ch in line:
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+        elif ch in QUOTES:
+            quote = ch
+    return quote
+
+
+def code_chars(text: str, quote: str | None = None):
+    """Yield (index, char) only for characters OUTSIDE string literals.
+    `quote` = the string the text starts inside (when the cursor is in the middle of a string)."""
+    escaped = False
+    for i, ch in enumerate(text):
+        if quote:                      # inside a string: skip until its closing quote
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in QUOTES:               # a string starts here
+            quote = ch
+            continue
+        yield i, ch
+
+
+def cut_at_suffix_closer(text: str, suffix: str, cursor_line: str = "") -> str:
     """Mid-line: if the rest of the line already starts with a closer like ) or ",
-    stop where the model writes that same closer (at bracket depth 0)."""
+    stop where the model writes that same closer (at bracket depth 0, outside strings)."""
     rest = suffix.split("\n", 1)[0].strip()
     if not rest or rest[0] not in ")]}\"';":
         return text
-    target, depth = rest[0], 0
-    for i, ch in enumerate(text):
+    target = rest[0]
+    if target in QUOTES:               # cursor is inside a string: stop at the quote that closes it
+        escaped = False
+        for i, ch in enumerate(text):
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == target:
+                return text[:i]
+        return text
+    depth = 0
+    for i, ch in code_chars(text, open_quote(cursor_line)):
         if ch == target and depth == 0:
             return text[:i]
         if ch in OPEN:
@@ -20,10 +68,11 @@ def cut_at_suffix_closer(text: str, suffix: str) -> str:
     return text
 
 
-def cut_at_unbalanced_close(text: str) -> str:
-    """Block mode: stop at a } ) ] that closes something opened BEFORE the suggestion."""
+def cut_at_unbalanced_close(text: str, quote: str | None = None) -> str:
+    """Block mode: stop at a } ) ] that closes something opened BEFORE the suggestion
+    (brackets inside strings are ignored)."""
     depth = 0
-    for i, ch in enumerate(text):
+    for i, ch in code_chars(text, quote):
         if ch in OPEN:
             depth += 1
         elif ch in CLOSE:
@@ -98,9 +147,9 @@ def clean(text: str, prefix: str, suffix: str, single_line: bool) -> str:
     cursor_line = prefix.rsplit("\n", 1)[-1]
     base_indent = len(cursor_line) - len(cursor_line.lstrip())
     if single_line:
-        out = cut_at_suffix_closer(text, suffix)
+        out = cut_at_suffix_closer(text, suffix, cursor_line)
     else:
-        out = cut_at_unbalanced_close(text)
+        out = cut_at_unbalanced_close(text, open_quote(cursor_line))
         out = cut_at_dedent(out, base_indent)
         out = cut_at_block_end(out, base_indent)
         out = "\n".join(out.split("\n")[:MAX_LINES])
