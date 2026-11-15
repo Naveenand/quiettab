@@ -14,6 +14,7 @@ import com.intellij.codeInsight.inline.completion.InlineCompletionEventType
 import com.intellij.codeInsight.inline.completion.InlineCompletionProvider
 import com.intellij.codeInsight.inline.completion.InlineCompletionProviderID
 import com.intellij.codeInsight.inline.completion.InlineCompletionRequest
+import com.intellij.openapi.editor.Document
 import com.intellij.codeInsight.inline.completion.elements.InlineCompletionGrayTextElement
 import com.intellij.codeInsight.inline.completion.suggestion.InlineCompletionSingleSuggestion
 import com.intellij.codeInsight.inline.completion.suggestion.InlineCompletionSuggestion
@@ -60,6 +61,7 @@ class QuietTabProvider : InlineCompletionProvider {
     @Volatile private var shownAt = 0L               // when the current gray text appeared
     @Volatile private var partialChars = 0           // chars taken word-by-word (Ctrl+Right)
     private val watched = Collections.synchronizedSet(Collections.newSetFromMap(WeakHashMap<Editor, Boolean>()))
+    private val anchors = Collections.synchronizedMap(WeakHashMap<Document, Int>())   // Fix 12: where each file's prefix window starts
 
     // Fix 8: the IDE tells us exactly what happened to the gray text (Tab, typed it, Esc, moved away...)
     private val outcomeListener = object : InlineCompletionEventAdapter {
@@ -143,7 +145,7 @@ class QuietTabProvider : InlineCompletionProvider {
             }
             val drops = dropped.map { it to followState(it) }
             Ctx(
-                prefix = text.subSequence(maxOf(0, cursor - PREFIX_CHARS), cursor).toString(),
+                prefix = text.subSequence(prefixStart(request.document, text, cursor), cursor).toString(),
                 suffix = text.subSequence(cursor, minOf(text.length, cursor + SUFFIX_CHARS)).toString(),
                 cursor = cursor,
                 // real code later on this line (not just ) ] } ; " or spaces) -> don't push text into it
@@ -309,6 +311,20 @@ class QuietTabProvider : InlineCompletionProvider {
         }
         cont.invokeOnCancellation { cancel(true) }
     }
+    // Fix 12: start of the prefix window. It stays put while you type (so llama.cpp can reuse its
+    // prompt cache), always begins at a line start, and jumps forward only when the window gets too big.
+    private fun prefixStart(doc: Document, text: CharSequence, cursor: Int): Int {
+        val old = anchors[doc]
+        if (old != null && old <= cursor && cursor - old <= PREFIX_CHARS + PREFIX_SLACK &&
+            (old == 0 || text[old - 1] == '\n')) return old
+        var start = maxOf(0, cursor - PREFIX_CHARS)
+        if (start > 0 && text[start - 1] != '\n') {
+            val nl = text.indexOf('\n', start)
+            if (nl in 0 until cursor) start = nl + 1          // begin at a whole line
+        }
+        anchors[doc] = start
+        return start
+    }
 
     // ---- helpers ----
     private fun empty() = InlineCompletionSingleSuggestion.build { }
@@ -366,6 +382,7 @@ class QuietTabProvider : InlineCompletionProvider {
         const val BASE = "http://localhost:8000"
         const val PREFIX_CHARS = 1500
         const val SUFFIX_CHARS = 500
+        const val PREFIX_SLACK = 1000   // window grows up to 1500 + 1000 chars before jumping forward
         private val CLASS_LIKE = Regex("\\b(class|interface|enum|object|record)\\b")
         private val SECRET_NAMES = Regex("""(?i)^\.env(\..*)?$|\.(pem|key|p12|pfx|jks|keystore)$|secret|credential|id_rsa""")
         fun isSensitive(name: String) = SECRET_NAMES.containsMatchIn(name)

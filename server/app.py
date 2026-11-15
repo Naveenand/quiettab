@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import json
 import math
 import os
@@ -27,6 +28,8 @@ client = httpx.AsyncClient(timeout=1.0)     # same 1 s budget as the plugin
 
 # Fix 11: count suggestions we stopped early, and model failures
 STATS = {"cancelled": 0, "llama_errors": 0}
+# Fix 12: llama.cpp timings of recent model calls: (prompt tokens read fresh, prompt ms, generate ms, tokens reused from cache)
+RECENT = deque(maxlen=200)
 
 
 async def ask_llama(request: Request, payload: dict):
@@ -57,7 +60,21 @@ async def ask_llama(request: Request, payload: dict):
 
 @app.get("/stats")
 async def stats():
-    return STATS
+    def pct(i, q):
+        v = sorted(r[i] for r in RECENT if r[i] is not None)
+        return round(v[min(len(v) - 1, int(q * len(v)))], 1) if v else None
+    return {**STATS, "calls": len(RECENT),
+            "prompt_tokens_p50": pct(0, 0.5), "prompt_tokens_p90": pct(0, 0.9),   # tokens llama had to READ (lower = better cache use)
+            "prompt_ms_p50": pct(1, 0.5), "prompt_ms_p90": pct(1, 0.9),
+            "gen_ms_p50": pct(2, 0.5), "gen_ms_p90": pct(2, 0.9),
+            "cached_tokens_p50": pct(3, 0.5)}                                     # tokens reused from the last request
+
+
+@app.post("/stats/reset")
+async def stats_reset():
+    RECENT.clear()
+    STATS.update(cancelled=0, llama_errors=0)
+    return {"ok": True}
 
 
 class CompleteRequest(BaseModel):
@@ -106,6 +123,8 @@ async def complete(req: CompleteRequest, request: Request):
     })
     if data is None:                 # plugin hung up, or llama failed (reason printed in this terminal)
         return Response(status_code=503)
+    t = data.get("timings") or {}
+    RECENT.append((t.get("prompt_n"), t.get("prompt_ms"), t.get("predicted_ms"), t.get("cache_n", data.get("tokens_cached"))))
 
     if DEBUG:
         prompt = data.get("prompt") or ""
