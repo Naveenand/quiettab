@@ -9,10 +9,12 @@ Metrics: exact match, chrF (0-100, character overlap), valid code (file still pa
          latency p50/p90 (server-side model time).
 
 Usage:  python run_eval.py --points data/points.jsonl --name baseline
+The server needs its token: same QT_TOKEN_FILE as uvicorn (default ~/.quiettab/token).
 """
 import argparse
 import ast
 import json
+import os
 import statistics
 import time
 from pathlib import Path
@@ -21,7 +23,23 @@ import httpx
 from sacrebleu.metrics import CHRF
 
 PREFIX_CHARS, SUFFIX_CHARS = 1500, 500   # same window as the plugin
+TOKEN_FILE = Path(os.environ.get("QT_TOKEN_FILE", Path.home() / ".quiettab" / "token"))
 chrf = CHRF()
+
+
+def ask(client, url, body, tries=3):
+    """POST /complete. A hiccup (503, timeout) is retried; after `tries` failures we give up on this point (None)."""
+    for attempt in range(tries):
+        try:
+            r = client.post(url, json=body)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (401, 403):
+                raise SystemExit(f"server refused the request ({r.status_code}): is QT_TOKEN_FILE the same as uvicorn's? ({TOKEN_FILE})")
+        except httpx.HTTPError:
+            pass
+        time.sleep(0.5 * (attempt + 1))
+    return None
 
 
 def norm(code: str) -> str:
@@ -53,19 +71,27 @@ def main():
     if args.limit:
         points = points[:args.limit]
     out_dir = Path("results"); out_dir.mkdir(exist_ok=True)
-    rows = []
+    if not TOKEN_FILE.exists():
+        raise SystemExit(f"no token at {TOKEN_FILE}: start uvicorn once, or set QT_TOKEN_FILE like uvicorn's")
+    rows, skipped = [], []
 
-    with httpx.Client(timeout=10) as client:
+    # rows are written as we go: a crash halfway still leaves everything done so far on disk
+    with open(out_dir / f"{args.name}.jsonl", "w") as out, \
+            httpx.Client(timeout=10, headers={"X-QuietTab-Token": TOKEN_FILE.read_text().strip()}) as client:
         for i, p in enumerate(points, 1):
             req = {"prefix": p["prefix"][-PREFIX_CHARS:], "suffix": p["suffix"][:SUFFIX_CHARS]}
+            answers = []
             for use_extra in (False, True):
-                body = dict(req, extra=p["extra"] if use_extra else [])
                 t0 = time.perf_counter()
-                res = client.post(f"{args.server}/complete", json=body).json()
-                wall_ms = (time.perf_counter() - t0) * 1000
+                res = ask(client, f"{args.server}/complete", dict(req, extra=p["extra"] if use_extra else []))
+                answers.append((use_extra, res, (time.perf_counter() - t0) * 1000))
+            if any(res is None for _, res, _ in answers):   # skip the WHOLE point, so every setup is scored on the same points
+                skipped.append(p["id"])
+                continue
+            for use_extra, res, wall_ms in answers:
                 variants = [("+context", res["text"])] if use_extra else [("raw", res["raw_text"]), ("+cleanup", res["text"])]
                 for variant, pred in variants:
-                    rows.append({
+                    row = {
                         "id": p["id"], "kind": p["kind"], "variant": variant, "pred": pred, "middle": p["middle"],
                         "has_extra": bool(p["extra"]),
                         "em": norm(pred) == norm(p["middle"]),
@@ -73,13 +99,14 @@ def main():
                         "valid": is_valid(p["prefix"], pred, p["suffix"]),
                         "latency_ms": res["latency_ms"], "wall_ms": round(wall_ms),
                         "avg_logprob": res["avg_logprob"], "min_logprob": res["min_logprob"],
-                    })
+                    }
+                    rows.append(row)
+                    out.write(json.dumps(row) + "\n")
+            out.flush()
             if i % 25 == 0:
-                print(f"  {i}/{len(points)} points done")
-
-    with open(out_dir / f"{args.name}.jsonl", "w") as f:
-        for r in rows:
-            f.write(json.dumps(r) + "\n")
+                print(f"  {i}/{len(points)} points done ({len(skipped)} skipped)")
+    if skipped:
+        print(f"!! skipped {len(skipped)} points after 3 tries each (server errors): ids {skipped[:10]}{' ...' if len(skipped) > 10 else ''}")
 
     # ---- summary table ----
     def summarize(sel):
@@ -88,7 +115,7 @@ def main():
                 f"| {100 * sum(r['valid'] for r in sel) / len(sel):.1f} "
                 f"| {pct([r['latency_ms'] for r in sel], 0.5)} | {pct([r['latency_ms'] for r in sel], 0.9)} |")
 
-    lines = [f"## Eval: {args.name} ({len(points)} points)", "",
+    lines = [f"## Eval: {args.name} ({len(points) - len(skipped)} points" + (f", {len(skipped)} skipped" if skipped else "") + ")", "",
              "| setup | kind | n | exact match % | chrF | valid code % | p50 ms | p90 ms |",
              "|---|---|---|---|---|---|---|---|"]
     for variant in ("raw", "+cleanup", "+context"):

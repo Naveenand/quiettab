@@ -189,10 +189,8 @@ def main():
                     "prefix": prefix, "middle": middle, "suffix": suffix,
                     "extra": cheat_sheet(index, rel, prefix, tree),
                 })
-        rng.shuffle(repo_cands)
+                rng.shuffle(repo_cands)
         candidates += repo_cands[:MAX_PER_REPO]
-
-        # balance: ~60% line, ~40% block
 
     # balance: ~60% line, ~40% block
     lines = [c for c in candidates if c["kind"] == "line"]
@@ -211,9 +209,12 @@ def main():
     print(f"wrote {len(chosen)} points ({len(chosen) - n_block} line, {n_block} block) "
           f"from {len({c['repo'] for c in chosen})} repos -> {args.out}")
     print(f"points with a cheat sheet: {sum(1 for c in chosen if c['extra'])}")
-    
+
+
+
 
 
 if __name__ == "__main__":
+    t0 = time.perf_counter()          # start the stopwatch BEFORE the work
     main()
-    t0 = time.perf_counter()
+    print(f"build time: {time.perf_counter() - t0:.1f} s")

@@ -71,7 +71,7 @@ def main():
         model = LogisticRegression(max_iter=1000).fit(X[train], y[train])
         p_oof[test] = model.predict_proba(X[test])[:, 1]
 
-        # With ONE feature the gate is just "a cutoff on that number": the ranking can't overfit,
+    # With ONE feature the gate is just "a cutoff on that number": the ranking can't overfit,
     # so score it with the final model (fold-by-fold models put probabilities on different scales).
     final = LogisticRegression(max_iter=1000).fit(X, y)
     scores = final.predict_proba(X)[:, 1] if X.shape[1] == 1 else p_oof
@@ -117,7 +117,7 @@ def main():
         f"| avg_logprob only | - | - | {auarc_a:.2f} |",
         f"| learned gate (threshold {threshold:.2f}) | {show_rate:.0%} | {precision:.0%} | {auarc_g:.2f} |",
         "", "Weights (bigger = pushes toward 'show'): " +
-        ", ".join(f"{f} {w:+.2f}" for f, w in zip(FEATURES, gate["coef"])),
+            ", ".join(f"{f} {w:+.2f}" for f, w in zip(chosen, gate["coef"])),   # the features actually used
     ])
     Path("results/gate-summary.md").write_text(summary + "\n")
     print(summary)

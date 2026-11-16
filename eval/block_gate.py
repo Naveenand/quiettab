@@ -29,22 +29,25 @@ def p_good(r):  # same formula the server uses
 def good(r):    # same "good" definition as train_gate.py
     return bool(r["em"] or (r["valid"] and r["chrf"] >= args.good_chrf))
 
+def is_block(r):  # exactly the server's rule: the SUGGESTION has a newline (not the dataset's "kind")
+    return "\n" in r["pred"]
+
 def at(rs, thr):  # show rate and precision if we only show p_good >= thr
     shown = [r for r in rs if p_good(r) >= thr]
     prec = sum(good(r) for r in shown) / len(shown) if shown else float("nan")
     return len(shown) / len(rs), prec
 
-print(f"| kind | n | good (no gate) | shown @ {gate['threshold']:.2f} | precision @ {gate['threshold']:.2f} |")
+print(f"| suggestion | n | good (no gate) | shown @ {gate['threshold']:.2f} | precision @ {gate['threshold']:.2f} |")
 print("|---|---|---|---|---|")
 for kind in ["line", "block"]:
-    rs = [r for r in rows if r["kind"] == kind]
+    rs = [r for r in rows if is_block(r) == (kind == "block")]
     if not rs:
         continue
     show, prec = at(rs, gate["threshold"])
     print(f"| {kind} | {len(rs)} | {sum(map(good, rs)) / len(rs):.0%} | {show:.0%} | {prec:.0%} |")
 
 # block threshold: the LOWEST cutoff (= shows the most) that still reaches the target precision
-blocks = sorted([r for r in rows if r["kind"] == "block"], key=p_good, reverse=True)
+blocks = sorted([r for r in rows if is_block(r)], key=p_good, reverse=True)
 best, hits = None, 0
 for i, r in enumerate(blocks, 1):
     hits += good(r)

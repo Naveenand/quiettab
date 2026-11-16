@@ -209,9 +209,11 @@ class QuietTabProvider : InlineCompletionProvider {
             return empty()
         }
 
+
         // 5. Cheat sheet = imports + signatures of things you just used
         val tCtx = System.currentTimeMillis()
-        val extra = readAction { collectContext(request.file, request.document.charsSequence, ctx.cursor) }
+        // Fix 27: the prompt window really starts where the prefix starts (the anchor), not at cursor - 1500
+        val extra = readAction { collectContext(request.file, request.document.charsSequence, ctx.cursor, ctx.cursor - ctx.prefix.length) }
         base.addProperty("ctx_ms", System.currentTimeMillis() - tCtx)
         base.addProperty("n_extra", extra.size)
         base.addProperty("extra_chars", extra.sumOf { it.text.length })
@@ -274,8 +276,7 @@ class QuietTabProvider : InlineCompletionProvider {
 
     // ---- context (Step 5) ----
 
-    private fun collectContext(file: PsiFile, text: CharSequence, cursor: Int): List<Snippet> = try {
-        val winStart = maxOf(0, cursor - PREFIX_CHARS)
+    private fun collectContext(file: PsiFile, text: CharSequence, cursor: Int, winStart: Int): List<Snippet> = try {
         val winEnd = minOf(text.length, cursor + SUFFIX_CHARS)
         val out = LinkedHashMap<String, Snippet>()
 
@@ -300,7 +301,9 @@ class QuietTabProvider : InlineCompletionProvider {
             if (target.containingFile == file && start in winStart until winEnd) continue // already visible
             out.putIfAbsent("${vf.path}:$start", Snippet(vf.name, signatureOf(target)))
         }
-        out.values.toList()
+        // Fix 28: llama.cpp puts the cheat sheet BEFORE the code, so a new ORDER alone makes it re-read the whole
+        // prompt. A fixed order (imports first, then by file + position) keeps its prompt cache working.
+        out.entries.sortedWith(compareBy({ it.key != "imports" }, { it.key })).map { it.value }
     } catch (e: IndexNotReadyException) {
         emptyList()   // IDE is still indexing: just send no cheat sheet this time
     }
