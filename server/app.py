@@ -6,25 +6,45 @@ import os
 import time
 from pathlib import Path
 
+
 import httpx
 from fastapi import FastAPI, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from cleanup import clean
+from guard import Guard, load_or_create_token, proof
+from secguard import check_suggestion, redact, redact_event, secret_near_cursor
+from tuner import Tuner
 
 LOG_PATH = Path(__file__).parent / "logs" / "events.jsonl"
 LOG_PATH.parent.mkdir(exist_ok=True)
 DEBUG = os.getenv("QT_DEBUG") == "1"
 PROMPT_LOG = LOG_PATH.parent / "prompts.jsonl"
+LOG_MAX_BYTES, LOG_KEEP = 50_000_000, 3     # events.jsonl -> events.1.jsonl ... events.3.jsonl
 
-LLAMA_URL = "http://localhost:8012/infill"
+LLAMA_URL = os.getenv("QT_LLAMA_URL", "http://127.0.0.1:8012/infill")
+# llama-server started with --api-key: put the same key in this file (see HOW_TO_RUN.md)
+_key_file = Path(os.getenv("QT_LLAMA_KEY_FILE", Path.home() / ".quiettab" / "llama_key"))
+LLAMA_HEADERS = {"Authorization": f"Bearer {_key_file.read_text().strip()}"} if _key_file.exists() else {}
 
 # NEW (Step 7): load the confidence gate trained by eval/train_gate.py
 GATE_PATH = Path(__file__).parent / "gate.json"
 GATE = json.loads(GATE_PATH.read_text()) if GATE_PATH.exists() else None
 
+# Self-tuning silence (tuner.py): starts equal to the frozen gate, then learns per repo from accept/reject.
+# QT_TUNER=0 turns it off (frozen gate only). QT_TAU = minimum chance of acceptance to show (higher = quieter).
+TUNER = None
+if GATE and os.getenv("QT_TUNER", "1") != "0":
+    TUNER = Tuner(GATE["threshold"], GATE.get("block_threshold", GATE["threshold"]),
+                  tau=float(os.getenv("QT_TAU", "0.30")), explore=float(os.getenv("QT_EXPLORE", "0.05")))
+    TUNER.load([LOG_PATH.with_name(f"events.{i}.jsonl") for i in range(LOG_KEEP, 0, -1)] + [LOG_PATH])
+
+TOKEN = load_or_create_token()
 app = FastAPI()
+app.add_middleware(Guard, token=TOKEN)      # host check, no browsers, token, body size (see guard.py)
 client = httpx.AsyncClient(timeout=1.0)     # same 1 s budget as the plugin
+
+# Fix 11: count suggestions we stopped early, and model failures
 
 # Fix 11: count suggestions we stopped early, and model failures
 STATS = {"cancelled": 0, "llama_errors": 0}
@@ -35,7 +55,7 @@ RECENT = deque(maxlen=200)
 async def ask_llama(request: Request, payload: dict):
     """Call llama-server, but stop it if the plugin hangs up first (= the user typed again)."""
     async def call():
-        r = await client.post(LLAMA_URL, json=payload)
+        r = await client.post(LLAMA_URL, json=payload, headers=LLAMA_HEADERS)
         r.raise_for_status()
         return r.json()
 
@@ -57,6 +77,10 @@ async def ask_llama(request: Request, payload: dict):
         print(f"[quiettab] llama error: {type(e).__name__}: {e}", flush=True)
         return None
 
+@app.get("/health")
+async def health(nonce: str = ""):
+    """Open without a token. The plugin checks `proof` to be sure it's talking to the real server."""
+    return {"ok": True, "proof": proof(TOKEN, nonce)}
 
 @app.get("/stats")
 async def stats():
@@ -77,11 +101,21 @@ async def stats_reset():
     return {"ok": True}
 
 
+
+class ExtraItem(BaseModel):
+    """One cheat-sheet entry. Only these two fields ever reach llama.cpp."""
+    model_config = ConfigDict(extra="forbid")
+    filename: str = Field("", max_length=256)
+    text: str = Field("", max_length=4000)
+
+
 class CompleteRequest(BaseModel):
     prefix: str = Field(max_length=8000)
     suffix: str = Field(max_length=4000)
     max_tokens: int = Field(64, ge=1, le=128)
-    extra: list[dict] = Field(default_factory=list, max_length=8)
+    extra: list[ExtraItem] = Field(default_factory=list, max_length=8)
+    repo: str = Field("", max_length=64, pattern=r"^[A-Za-z0-9_\-]*$")   # hashed project id (self-tuning silence)
+
 
 
 def token_logprob(t: dict) -> float:
@@ -108,7 +142,18 @@ async def complete(req: CompleteRequest, request: Request):
     single_line = current_line.strip() != ""            # typing mid-line?
     stop = ["\n"] if single_line else ["\n\n", "\ndef ", "\nclass "]
     max_tokens = 32 if single_line else req.max_tokens
-    extra = [{**e, "text": e.get("text", "").rstrip("\n") + "\n"} for e in req.extra]
+    # 0. Security gate, input side: secrets never reach the model or the logs (secguard.py)
+    if secret_near_cursor(req.prefix, req.suffix) is not None:
+        return {"text": "", "raw_text": "", "show": False, "security": "secret_near_cursor",
+                "single_line": single_line, "latency_ms": round((time.perf_counter() - start) * 1000)}
+    prefix, found = redact(req.prefix)
+    suffix, found_s = redact(req.suffix)
+    extra = []
+    for e in req.extra:
+        e_text, found_e = redact(e.text)
+        found += found_e
+        extra.append({"filename": e.filename, "text": e_text.rstrip("\n") + "\n"})
+    found += found_s
 
     # 1. Ask the model (only llama.cpp settings go here)
     data = await ask_llama(request, payload={
@@ -121,7 +166,7 @@ async def complete(req: CompleteRequest, request: Request):
         "stop": stop,
         "input_extra": extra,    # cheat sheet: signatures from other files
     })
-    if data is None:                 # plugin hung up, or llama failed (reason printed in this terminal)
+    if data is None or not isinstance(data.get("content"), str):   # plugin hung up, or llama failed / odd reply
         return Response(status_code=503)
     t = data.get("timings") or {}
     RECENT.append((t.get("prompt_n"), t.get("prompt_ms"), t.get("predicted_ms"), t.get("cache_n", data.get("tokens_cached"))))
@@ -145,32 +190,78 @@ async def complete(req: CompleteRequest, request: Request):
     mn = min(logprobs) if logprobs else None
 
     # 3. Clean the text, then ask the gate (NEW, Step 7)
-    text = clean(data["content"], req.prefix, req.suffix, single_line)
+    text = clean(data["content"], prefix, suffix, single_line)
     p = p_good(avg, mn, text, single_line, bool(req.extra))
 
     is_block = "\n" in text            # the SUGGESTION has several lines
     thr = None
+
     if GATE:
         thr = GATE.get("block_threshold", GATE["threshold"]) if is_block else GATE["threshold"]
 
-    # 4. Reply to the plugin
+    # 3b. Security gate, output side: never suggest secrets or known-dangerous code
+    above = "\n".join(prefix.split("\n")[-6:-1])          # a few lines above, to understand a match
+    blocked, warnings = check_suggestion(text, current_line, context=above)
+    raw_text = redact(data["content"])[0]
+    if blocked:
+        text, raw_text = "", ""        # don't even send it to the plugin
+
+    # 3c. Show or stay quiet: the self-tuning gate if on, else the frozen gate
+    if TUNER and p is not None and not blocked:
+        decision = TUNER.decide(req.repo, p, is_block)
+    else:
+        decision = {"show": not blocked and ((p >= thr) if p is not None else GATE is None),   # no confidence -> quiet
+                    "q": None, "tau": None, "explore": False}
+
+        # 4. Reply to the plugin
     return {
+        "q": decision["q"],                                # tuned chance YOU accept it (None = tuner off)
+        "tau": decision["tau"],                            # show when q >= tau
+        "explore": decision["explore"],                    # shown just below tau, so the gate keeps learning
         "text": text,
-        "raw_text": data["content"],
+        "raw_text": raw_text,
+        "security": blocked,                               # rule id that blocked it, or None
+        "security_warnings": warnings,                     # shown, but flagged (policy = warn)
+        "redacted": len(found),                            # secrets kept out of the model this call
         "single_line": single_line,
         "avg_logprob": avg,
         "min_logprob": mn,
         "latency_ms": round((time.perf_counter() - start) * 1000),
         "p_good": p,                                       # NEW: how likely it's good
-        "show": (p >= thr) if p is not None else GATE is None,   # no confidence -> stay quiet
+        "show": decision["show"],
         "is_block": is_block,
     }
 
 
+def rotate_logs():
+    """events.jsonl full -> becomes events.1.jsonl (older ones shift up, the oldest is deleted)."""
+    for i in range(LOG_KEEP, 0, -1):
+        src = LOG_PATH if i == 1 else LOG_PATH.with_name(f"events.{i - 1}.jsonl")
+        if src.exists():
+            src.replace(LOG_PATH.with_name(f"events.{i}.jsonl"))
+
+
 @app.post("/log")
-async def log_event(event: dict):
-    if LOG_PATH.exists() and LOG_PATH.stat().st_size > 50_000_000:   # 50 MB cap
-        return {"ok": False, "reason": "log full"}
+async def log_event(event: dict):          # Guard already capped the body at 64 KB
+    event = redact_event(event)                       # no secrets in events.jsonl
+    line = json.dumps(event) + "\n"
+    if LOG_PATH.exists() and LOG_PATH.stat().st_size + len(line) > LOG_MAX_BYTES:
+        rotate_logs()                      # never stop logging: old events move aside instead
     with LOG_PATH.open("a") as f:
-        f.write(json.dumps(event) + "\n")
+        f.write(line)
+    if TUNER:
+        TUNER.observe(event, refit=False)  # accept/reject outcomes teach the self-tuning gate
+        if TUNER.due():                    # every 10 outcomes: refit in a worker thread, not on the request path
+            await asyncio.to_thread(TUNER.refit_due)
     return {"ok": True}
+
+
+@app.get("/calibration")
+async def calibration(repo: str = ""):
+    """Audit the silence for one repo: the fit, show rate and expected acceptance (tuned vs frozen gate),
+    and a reliability table (predicted vs actual acceptance). Without ?repo= : the list of repos."""
+    if TUNER is None:
+        return {"tuner": "off"}
+    if not repo:
+        return {"repos": {name: len(r.labels) for name, r in TUNER.repos.items()}, "tau": TUNER.tau}
+    return TUNER.report(repo)

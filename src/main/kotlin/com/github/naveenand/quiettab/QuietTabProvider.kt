@@ -41,6 +41,13 @@ import java.util.Collections
 import java.util.WeakHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.coroutines.cancellation.CancellationException
+import com.intellij.openapi.project.Project
+import java.nio.file.Files
+import java.nio.file.Paths
+import java.security.MessageDigest
+import java.util.UUID
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 class QuietTabProvider : InlineCompletionProvider {
     override val id = InlineCompletionProviderID("QuietTab")
@@ -62,6 +69,13 @@ class QuietTabProvider : InlineCompletionProvider {
     @Volatile private var partialChars = 0           // chars taken word-by-word (Ctrl+Right)
     private val watched = Collections.synchronizedSet(Collections.newSetFromMap(WeakHashMap<Editor, Boolean>()))
     private val anchors = Collections.synchronizedMap(WeakHashMap<Document, Int>())   // Fix 12: where each file's prefix window starts
+
+    // Security: the server only answers requests carrying this token (server/guard.py).
+    // The server writes the file; on Windows + WSL start it with QT_TOKEN_FILE=/mnt/c/Users/<you>/.quiettab/token
+    private val tokenFile = Paths.get(System.getenv("QT_TOKEN_FILE") ?: (System.getProperty("user.home") + "/.quiettab/token"))
+    @Volatile private var cachedToken: String? = null
+    @Volatile private var verifiedAt = 0L            // last time /health proved the server is the real one
+    @Volatile private var warned = false
 
     // Fix 8: the IDE tells us exactly what happened to the gray text (Tab, typed it, Esc, moved away...)
     private val outcomeListener = object : InlineCompletionEventAdapter {
@@ -111,6 +125,7 @@ class QuietTabProvider : InlineCompletionProvider {
         if (isSensitive(request.file.virtualFile?.name.orEmpty())) return empty()   // never send or log secrets
         if (watched.add(request.editor)) InlineCompletion.getHandlerOrNull(request.editor)?.addEventListener(outcomeListener)
         val cps = recordKeystroke(t0)
+        val repo = repoId(request.file.project)                                     // self-tuning silence learns per repo
 
         // 1. Read the code around the cursor
         val ctx = readAction {
@@ -179,6 +194,8 @@ class QuietTabProvider : InlineCompletionProvider {
 
         val base = JsonObject().apply {
             addProperty("ext", ctx.ext); addProperty("cps", cps); addProperty("delay_ms", waitMs)
+            addProperty("sid", UUID.randomUUID().toString())   // ties shown -> accepted/rejected/followed together
+            addProperty("repo", repo)
         }
 
         // 4. Gate 0: skip obviously bad moments without calling the model
@@ -201,8 +218,17 @@ class QuietTabProvider : InlineCompletionProvider {
 
         // 6. Ask the model server
         val tFetch = System.currentTimeMillis()
-        val res = fetch(ctx.prefix, ctx.suffix, extra) ?: return empty()
+        val res = fetch(ctx.prefix, ctx.suffix, extra, repo) ?: return empty()
         base.addProperty("rtt_ms", System.currentTimeMillis() - tFetch)   // plugin -> server -> plugin
+        // The server's verdicts travel with every event, so outcomes can teach the tuner (server/tuner.py)
+        for (key in listOf("p_good", "q", "tau", "explore", "is_block", "single_line", "redacted", "security_warnings")) {
+            res.get(key)?.let { if (!it.isJsonNull) base.add(key, it) }
+        }
+        // 6a. Security gate: the server refused this suggestion (a secret, or dangerous code like verify=False)
+        res.get("security")?.takeIf { !it.isJsonNull }?.let { rule ->
+            log(base.apply { addProperty("event", "blocked"); add("security", rule) })
+            return empty()
+        }
         val text = res.get("text")?.asString.orEmpty()
         if (text.isBlank()) {
             log(base.apply { addProperty("event", "empty") })
@@ -346,20 +372,66 @@ class QuietTabProvider : InlineCompletionProvider {
         else (100 + (1 - outcomes.count { it }.toDouble() / outcomes.size) * 200).toLong()
     }
 
-    private suspend fun fetch(prefix: String, suffix: String, extra: List<Snippet>): JsonObject? {
+    // ---- security: token + "is this really my server?" ----
+    private fun token(): String? = cachedToken ?: runCatching { Files.readString(tokenFile).trim() }.getOrNull()
+        ?.takeIf { it.isNotEmpty() }?.also { cachedToken = it }
+
+    private fun hmacHex(key: String, msg: String): String {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(key.toByteArray(), "HmacSHA256"))
+        return mac.doFinal(msg.toByteArray()).joinToString("") { "%02x".format(it) }
+    }
+
+    // Port squatting guard: another program could be listening on :8000. Only the real server knows the
+    // token, so only it can answer /health with HMAC(token, nonce). Checked before sending code: again after
+    // 30 s, and right after any failed call (a dead server is exactly when someone else could take the port).
+    private suspend fun serverIsReal(tok: String): Boolean {
+        if (System.currentTimeMillis() - verifiedAt < 30_000) return true
+        val nonce = UUID.randomUUID().toString()
+        return try {
+            val req = HttpRequest.newBuilder(URI.create("$BASE/health?nonce=$nonce"))
+                .timeout(Duration.ofMillis(1000)).GET().build()
+            val res = http.sendAsync(req, HttpResponse.BodyHandlers.ofString()).awaitOrAbort()
+            val proof = gson.fromJson(res.body(), JsonObject::class.java)?.get("proof")?.asString
+            val ok = proof != null && MessageDigest.isEqual(proof.toByteArray(), hmacHex(tok, nonce).toByteArray())
+            if (ok) verifiedAt = System.currentTimeMillis()
+            else thisLogger().warn("QuietTab: the program on $BASE failed the identity check; not sending code")
+            ok
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    // Project id for per-repo tuning: a hash, so the folder path itself never leaves the IDE
+    private fun repoId(project: Project): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest((project.basePath ?: project.name).toByteArray())
+        return digest.take(8).joinToString("") { "%02x".format(it) }
+    }
+
+    private suspend fun fetch(prefix: String, suffix: String, extra: List<Snippet>, repo: String): JsonObject? {
+        val tok = token()
+        if (tok == null) {
+            if (!warned) { warned = true; thisLogger().warn("QuietTab: no token at $tokenFile (start the server once; see HOW_TO_RUN.md)") }
+            return null
+        }
+        if (!serverIsReal(tok)) return null
         val body = JsonObject().apply {
             addProperty("prefix", prefix)
             addProperty("suffix", suffix)
+            addProperty("repo", repo)
             add("extra", JsonArray().apply {
                 extra.forEach { s -> add(JsonObject().apply { addProperty("filename", s.filename); addProperty("text", s.text) }) }
             })
         }
         return try {
             val res = http.sendAsync(post("$BASE/complete", body, 1000), HttpResponse.BodyHandlers.ofString()).awaitOrAbort()
-            if (res.statusCode() != 200) null else gson.fromJson(res.body(), JsonObject::class.java)
+            if (res.statusCode() != 200) { verifiedAt = 0; null } else gson.fromJson(res.body(), JsonObject::class.java)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            verifiedAt = 0                                   // re-check who is listening before the next call
             thisLogger().warn("QuietTab: server call failed: ${e.message}")
             null
         }
@@ -374,6 +446,7 @@ class QuietTabProvider : InlineCompletionProvider {
         HttpRequest.newBuilder(URI.create(url))
             .timeout(Duration.ofMillis(timeoutMs))
             .header("Content-Type", "application/json")
+            .header("X-QuietTab-Token", token().orEmpty())
             .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(body)))
             .build()
 

@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy to security_policy.json (same folder) to change what each rule does. block = never show, warn = show but log, off = ignore. Restart uvicorn after editing. Rule ids: see CODE_RULES in secguard.py.",
+  "rules": {
+    "shell_true": "warn",
+    "sql_string_build": "block",
+    "pickle_load": "warn"
+  }
+}
