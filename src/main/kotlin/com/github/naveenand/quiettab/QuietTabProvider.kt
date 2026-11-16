@@ -179,7 +179,6 @@ class QuietTabProvider : InlineCompletionProvider {
 
         val base = JsonObject().apply {
             addProperty("ext", ctx.ext); addProperty("cps", cps); addProperty("delay_ms", waitMs)
-            addProperty("drops_following", ctx.drops.count { it.second == 0 })   // DEBUG Fix 8b
         }
 
         // 4. Gate 0: skip obviously bad moments without calling the model

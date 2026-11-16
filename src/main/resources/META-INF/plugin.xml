@@ -1,20 +1,23 @@
 <!-- Plugin Configuration File. Read more: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
 <idea-plugin>
     <id>com.github.naveenand.quiettab</id>
-    <name>quiettab</name>
-    <vendor>naveenand</vendor>
+    <name>QuietTab</name>
+    <vendor url="https://github.com/Naveenand/quiettab">Naveen Yadav Golla</vendor>
     <description><![CDATA[
-        <p><b>quiettab</b> is a repository that provides a pure template to make it easier to create a new plugin project.</p>
-        <p>The main goal of this template is to speed up the setup phase of plugin development for both new and experienced developers by preconfiguring the project scaffold and CI, linking to the proper documentation pages, and keeping everything organized.</p>
+        <p><b>QuietTab</b> is a Copilot-style inline autocomplete that stays quiet when it isn't sure.</p>
+        <ul>
+            <li>Gray-text suggestions from a local model (Qwen2.5-Coder-1.5B via llama.cpp); press <b>Tab</b> to accept.</li>
+            <li>A calibrated confidence gate hides suggestions that are probably wrong.</li>
+            <li>Rule filters skip bad moments (mid-word, inside comments, code right after the cursor).</li>
+            <li>Output cleanup: syntax-aware truncation, no duplicated closing brackets, no copied lines.</li>
+            <li>Never sends secret files (.env, keys, credentials) to the model.</li>
+        </ul>
+        <p>Needs the QuietTab model server running locally. See the README for setup.</p>
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
 
-    <resource-bundle>messages.MyBundle</resource-bundle>
-
     <extensions defaultExtensionNs="com.intellij">
         <inline.completion.provider implementation="com.github.naveenand.quiettab.QuietTabProvider"/>
-        <toolWindow factoryClass="com.github.naveenand.quiettab.toolWindow.MyToolWindowFactory" id="MyToolWindow"/>
-        <postStartupActivity implementation="com.github.naveenand.quiettab.startup.MyProjectActivity" />
     </extensions>
 </idea-plugin>
