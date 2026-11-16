@@ -17,7 +17,7 @@ import json
 import random
 import re
 from pathlib import Path
-
+import time
 PREFIX_CHARS, SUFFIX_CHARS = 1500, 500   # same window as the plugin
 MAX_PER_FILE = 4
 MAX_PER_REPO = 120   # so one huge repo can't dominate the exam
@@ -211,7 +211,9 @@ def main():
     print(f"wrote {len(chosen)} points ({len(chosen) - n_block} line, {n_block} block) "
           f"from {len({c['repo'] for c in chosen})} repos -> {args.out}")
     print(f"points with a cheat sheet: {sum(1 for c in chosen if c['extra'])}")
+    
 
 
 if __name__ == "__main__":
     main()
+    t0 = time.perf_counter()
